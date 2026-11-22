@@ -5,41 +5,17 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug)]
-struct Hwmon {
-    path: PathBuf,
-    name: String,
-}
+const EC_IO_PATH: &str = "/sys/kernel/debug/ec/ec0/io";
+const PRODUCT_NAME_PATH: &str = "/sys/class/dmi/id/product_name";
+const HWMON_PATH: &str = "/sys/class/hwmon";
+const SUPPORTED_MODEL: &str = "PH315-51";
+const MAX_PLAUSIBLE_RPM: u16 = 10_000;
 
-#[derive(Debug)]
-struct Sensor {
-    value: f32,
-    name: String,
-}
-
-/* EC mode registers and values reverse-engineered for the Acer Predator
-PH315-51. Source: https://github.com/yaroslavyushchenko/acer-predator-ph315-51-fun-control */
-
-const CPU_MODE_ADDR: u64 = 0x22;
-const GPU_MODE_ADDR: u64 = 0x21;
-const CPU_AUTO_MODE: u8 = 0x54;
-const GPU_AUTO_MODE: u8 = 0x50;
-const CPU_MAX_FAN_MODE: u8 = 0x58;
-const GPU_MAX_FAN_MODE: u8 = 0x60;
-const CPU_MANUAL_MODE: u8 = 0x5C;
-const GPU_MANUAL_MODE: u8 = 0x70;
-const CPU_FAN_SPEED_ADDR: u64 = 0x37;
-const GPU_FAN_SPEED_ADDR: u64 = 0x3A;
-
-/*The PH315-51 DSDT labels 16-bit fields C1FR/G1FR at offsets 0x13/0x15
-in its ECMM SystemMemory region. NBFC reads the same offsets as
-little-endian EC words on related G3-572/PH315-53 models:
-https://github.com/nbfc-linux/nbfc-linux/blob/main/share/nbfc/configs/Acer%20Predator%20PH315-53.json
-This is a strong cross-check, but not a live probe of this laptop's BIOS revision.*/
-const CPU_FAN_RPM_ADDR: u64 = 0x13;
-const GPU_FAN_RPM_ADDR: u64 = 0x15;
-
-#[derive(Debug, Clone, Copy)]
+/* EC mode registers and values reverse-engineered for the Acer Predator PH315-51.
+ * Mode offsets: https://github.com/yaroslavyushchenko/acer-predator-ph315-51-fun-control
+ * RPM offsets (DSDT C1FR/G1FR): https://github.com/nbfc-linux/nbfc-linux/blob/main/share/nbfc/configs/Acer%20Predator%20PH315-53.json
+ */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FanProfile {
     Auto,
     Performance,
@@ -47,233 +23,306 @@ enum FanProfile {
 }
 
 impl FanProfile {
-    fn apply(&self) -> io::Result<()> {
+    fn writes(self) -> &'static [(u64, u8)] {
         match self {
-            FanProfile::Auto => {
-                write_ec_register(CPU_MODE_ADDR, CPU_AUTO_MODE)?;
-                write_ec_register(GPU_MODE_ADDR, GPU_AUTO_MODE)?;
-            }
-            FanProfile::Performance => {
-                write_ec_register(CPU_MODE_ADDR, CPU_MAX_FAN_MODE)?;
-                write_ec_register(GPU_MODE_ADDR, GPU_MAX_FAN_MODE)?;
-            }
-            FanProfile::Manual(percent) => {
-                write_ec_register(CPU_MODE_ADDR, CPU_MANUAL_MODE)?;
-                write_ec_register(GPU_MODE_ADDR, GPU_MANUAL_MODE)?;
-                write_ec_register(CPU_FAN_SPEED_ADDR, *percent)?;
-                write_ec_register(GPU_FAN_SPEED_ADDR, *percent)?;
+            Self::Auto => &[(0x22, 0x54), (0x21, 0x50)],
+            Self::Performance => &[(0x22, 0x58), (0x21, 0x60)],
+            Self::Manual(_) => &[(0x22, 0x5C), (0x21, 0x70)],
+        }
+    }
+
+    fn apply(self) -> io::Result<()> {
+        let mut ec = OpenOptions::new().read(true).write(true).open(EC_IO_PATH)?;
+        self.apply_to(&mut ec)
+    }
+
+    fn apply_to<W: Write + Seek>(self, ec: &mut W) -> io::Result<()> {
+        for &(addr, val) in self.writes() {
+            ec.seek(SeekFrom::Start(addr))?;
+            ec.write_all(&[val])?;
+        }
+        if let Self::Manual(percent) = self {
+            for addr in [0x37, 0x3A] {
+                ec.seek(SeekFrom::Start(addr))?;
+                ec.write_all(&[percent])?;
             }
         }
         Ok(())
     }
+
+    fn summary(self) -> String {
+        match self {
+            Self::Auto => "Fan profile applied: Auto".into(),
+            Self::Performance => "Fan profile applied: Performance (max)".into(),
+            Self::Manual(pct) => format!(
+                "Fan speed set to {pct}% (fixed manual mode; use -a to return to automatic control)."
+            ),
+        }
+    }
 }
 
-// Hardware write function (Embedded Controller)
-fn write_ec_register(address: u64, value: u8) -> std::io::Result<()> {
-    let mut ec_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/sys/kernel/debug/ec/ec0/io")?;
-    ec_file.seek(SeekFrom::Start(address))?;
-    ec_file.write_all(&[value])?;
-    Ok(())
+struct Hwmon {
+    path: PathBuf,
+    name: String,
 }
 
-fn read_ec_rpm(address: u64) -> Option<u16> {
-    let mut file = File::open("/sys/kernel/debug/ec/ec0/io").ok()?;
-    file.seek(SeekFrom::Start(address)).ok()?;
+impl Hwmon {
+    fn discover() -> Vec<Self> {
+        Self::discover_in(Path::new(HWMON_PATH))
+    }
 
-    let mut bytes = [0u8; 2];
-    file.read_exact(&mut bytes).ok()?;
-    let rpm = u16::from_le_bytes(bytes);
+    fn discover_in(dir: &Path) -> Vec<Self> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut hwmons: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                let name = fs::read_to_string(path.join("name")).ok()?.trim().to_string();
+                Some(Self { path, name })
+            })
+            .collect();
+        hwmons.sort_by(|a, b| a.name.cmp(&b.name));
+        hwmons
+    }
 
-    // Reject obvious non-RPM values if the EC map differs on this BIOS.
-    (rpm <= 10_000).then_some(rpm)
+    fn temperatures(&self) -> Vec<(String, f32)> {
+        (1..=10)
+            .filter_map(|i| {
+                let raw = fs::read_to_string(self.path.join(format!("temp{i}_input"))).ok()?;
+                let celsius = raw.trim().parse::<f32>().ok()? / 1000.0;
+                let label = fs::read_to_string(self.path.join(format!("temp{i}_label")))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("temp{i}"));
+                Some((label, celsius))
+            })
+            .collect()
+    }
 }
 
-fn read_file(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok()
+fn read_ec_rpms() -> Option<(Option<u16>, Option<u16>)> {
+    let mut ec = File::open(EC_IO_PATH).ok()?;
+    Some(read_ec_rpms_from(&mut ec))
+}
+
+fn read_ec_rpms_from<R: Read + Seek>(ec: &mut R) -> (Option<u16>, Option<u16>) {
+    let mut read_word = |addr: u64| -> Option<u16> {
+        ec.seek(SeekFrom::Start(addr)).ok()?;
+        let mut buf = [0u8; 2];
+        ec.read_exact(&mut buf).ok()?;
+        let rpm = u16::from_le_bytes(buf);
+        (rpm <= MAX_PLAUSIBLE_RPM).then_some(rpm)
+    };
+    (read_word(0x13), read_word(0x15))
 }
 
 fn is_supported_model() -> bool {
-    read_file(Path::new("/sys/class/dmi/id/product_name"))
-        .map(|model| model.to_ascii_uppercase().contains("PH315-51"))
-        .unwrap_or(false)
+    is_supported_model_at(Path::new(PRODUCT_NAME_PATH))
 }
 
-fn find_hwmons(dir_path: &Path) -> Vec<Hwmon> {
-    let mut hwmons = Vec::new();
-    let Ok(entries) = fs::read_dir(dir_path) else {
-        return hwmons;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = read_file(&path.join("name")) else {
-            continue;
-        };
-        hwmons.push(Hwmon {
-            path,
-            name: name.trim().to_string(),
-        });
-    }
-    hwmons
+fn is_supported_model_at(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|m| m.to_ascii_uppercase().contains(SUPPORTED_MODEL))
 }
 
-fn read_temperature(path: &Path) -> Option<f32> {
-    let value = read_file(path)?;
-    let millidegrees: f32 = value.trim().parse().ok()?;
-    Some(millidegrees / 1000.0)
-}
-
-fn read_sensors(hwmon: &Hwmon) -> Vec<Sensor> {
-    let mut sensors = Vec::new();
-    for i in 1..=10 {
-        let input = hwmon.path.join(format!("temp{}_input", i));
-        if let Some(value) = read_temperature(&input) {
-            let label_path = hwmon.path.join(format!("temp{}_label", i));
-            let name = read_file(&label_path)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| format!("temp{}", i));
-            sensors.push(Sensor { name, value });
-        }
-    }
-    sensors
-}
-
-fn read_fan_speeds(hwmon: &Hwmon) -> Vec<(String, u32)> {
-    let mut fans = Vec::new();
-    for i in 1..=8 {
-        let input = hwmon.path.join(format!("fan{}_input", i));
-        let Some(rpm) = read_file(&input).and_then(|value| value.trim().parse().ok()) else {
-            continue;
-        };
-
-        let label_path = hwmon.path.join(format!("fan{}_label", i));
-        let name = read_file(&label_path)
-            .map(|label| label.trim().to_string())
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| format!("{} fan{}", hwmon.name, i));
-        fans.push((name, rpm));
-    }
-    fans
-}
-
-fn display(hwmons: &[Hwmon]) {
+fn render_dashboard(hwmons: &[Hwmon]) {
     print!("\x1B[2J\x1B[1;1H");
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
 
     println!("========================================");
-    println!("           PREDATOR CONTROL             ");
-    println!("========================================");
-    println!();
+    println!("          PREDATOR FAN CONTROL          ");
+    println!("========================================\n");
 
-    // 1. Display temperatures via hwmon (standard ACPI)
     for hwmon in hwmons {
-        let sensors = read_sensors(hwmon);
-        if sensors.is_empty() {
+        let temps = hwmon.temperatures();
+        if temps.is_empty() {
             continue;
         }
-
         println!("-- {} --", hwmon.name.to_uppercase());
-        for sensor in sensors {
-            println!("   {:<15} {:>6.1} °C", sensor.name, sensor.value);
+        for (label, celsius) in temps {
+            println!("   {label:<15} {celsius:>6.1} °C");
         }
         println!();
     }
 
-    println!("-- VENTILATEURS --");
-    let (cpu_rpm, gpu_rpm) = if is_supported_model() {
-        (read_ec_rpm(CPU_FAN_RPM_ADDR), read_ec_rpm(GPU_FAN_RPM_ADDR))
-    } else {
-        (None, None)
-    };
-
-    if cpu_rpm.is_some() || gpu_rpm.is_some() {
-        match cpu_rpm {
-            Some(rpm) => println!("   CPU Fan         {:>6} RPM", rpm),
-            None => println!("   CPU Fan              N/D"),
-        }
-        match gpu_rpm {
-            Some(rpm) => println!("   GPU Fan         {:>6} RPM", rpm),
-            None => println!("   GPU Fan              N/D"),
-        }
-    } else {
-        let fans: Vec<_> = hwmons.iter().flat_map(read_fan_speeds).collect();
-        if fans.is_empty() {
-            println!("   RPM indisponibles (EC inaccessible, aucun fan*_input hwmon)");
-        } else {
-            for (name, rpm) in fans {
-                println!("   {:<15} {:>6} RPM", name, rpm);
+    println!("-- FANS --");
+    match read_ec_rpms() {
+        Some((cpu, gpu)) => {
+            for (name, rpm) in [("CPU Fan", cpu), ("GPU Fan", gpu)] {
+                match rpm {
+                    Some(v) => println!("   {name:<15} {v:>6} RPM"),
+                    None => println!("   {name:<15}    N/A"),
+                }
             }
         }
+        None => println!("   RPM unavailable (run with sudo and ec_sys loaded)"),
     }
-    println!();
-    println!("========================================");
+    println!("\n========================================");
 }
-{"*******", "*d----*", "**---a*", "*******"};
+
+fn parse_profile(args: &[String]) -> Result<Option<FanProfile>, &'static str> {
+    match args {
+        [] => Ok(None),
+        [f] if f == "-a" || f == "--auto" => Ok(Some(FanProfile::Auto)),
+        [f] if f == "-p" || f == "--performance" => Ok(Some(FanProfile::Performance)),
+        [f, val] if f == "-s" || f == "--speed" => val
+            .parse::<u8>()
+            .ok()
+            .filter(|&v| v <= 100)
+            .map(|v| Some(FanProfile::Manual(v)))
+            .ok_or("Speed must be an integer between 0 and 100."),
+        _ => Err("Unrecognized arguments."),
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: sudo predator-fan-control [-a | --auto | -p | --performance | -s <0..100> | --speed <0..100>]"
+    );
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = env::args().skip(1).collect();
 
-    if args.len() > 1 {
-        let profile = match args[1].as_str() {
-            "-p" | "--performance" => Some(FanProfile::Performance),
-            "-a" | "--auto" => Some(FanProfile::Auto),
-            "--speed" | "-s" if args.len() > 2 => args[2]
-                .parse::<u8>()
-                .ok()
-                .filter(|speed| *speed <= 100)
-                .map(FanProfile::Manual),
-            "-set" if args.len() > 2 => match args[2].as_str() {
-                "performance" => Some(FanProfile::Performance),
-                "auto" => Some(FanProfile::Auto),
-                _ => None,
-            },
-            _ => None,
-        };
-
-        match profile {
-            Some(p) => {
-                if !is_supported_model() {
-                    eprintln!(
-                        "Refus d'écrire dans l'EC : seul l'Acer Predator PH315-51 est pris en charge."
-                    );
-                    std::process::exit(2);
-                }
-                match p.apply() {
-                    Ok(()) => match p {
-                        FanProfile::Manual(percent) => println!(
-                            "Ventilateurs réglés à {} % (mode manuel fixe ; utilisez -a pour revenir à la régulation automatique).",
-                            percent
-                        ),
-                        _ => println!("Fan profile applied: {:?}", p),
-                    },
-                    Err(error) => {
-                        eprintln!("Impossible d'appliquer le profil {:?} : {}", p, error);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            None => {
-                eprintln!("Error: unrecognized hardware argument.");
-                eprintln!(
-                    "Usage: sudo predatorfc [-a | -p | --speed 0..100 | -set auto | -set performance]"
-                );
-            }
-        }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print_usage();
         return;
     }
 
-    let target_path = Path::new("/sys/class/hwmon");
-    let hwmons = find_hwmons(target_path);
-
-    if hwmons.is_empty() {
-        eprintln!("No hwmon component found.");
-        // Keep the UI running so it can report that sensor data is unavailable.
+    if !is_supported_model() {
+        eprintln!("Error: only the Acer Predator {SUPPORTED_MODEL} is supported.");
+        std::process::exit(2);
     }
 
-    loop {
-        display(&hwmons);
-        thread::sleep(Duration::from_secs(1));
+    match parse_profile(&args) {
+        Ok(Some(profile)) => match profile.apply() {
+            Ok(()) => println!("{}", profile.summary()),
+            Err(e) => {
+                eprintln!("Failed to apply fan profile {:?}: {e}", profile);
+                std::process::exit(1);
+            }
+        },
+        Ok(None) => {
+            let hwmons = Hwmon::discover();
+            if hwmons.is_empty() {
+                eprintln!("No hwmon component found.");
+            }
+            loop {
+                render_dashboard(&hwmons);
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            print_usage();
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vec_str(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_valid_profiles() {
+        assert_eq!(parse_profile(&vec_str(&[])), Ok(None));
+        assert_eq!(parse_profile(&vec_str(&["-a"])), Ok(Some(FanProfile::Auto)));
+        assert_eq!(
+            parse_profile(&vec_str(&["--performance"])),
+            Ok(Some(FanProfile::Performance))
+        );
+        assert_eq!(
+            parse_profile(&vec_str(&["--speed", "75"])),
+            Ok(Some(FanProfile::Manual(75)))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_profiles() {
+        assert!(parse_profile(&vec_str(&["--speed", "101"])).is_err());
+        assert!(parse_profile(&vec_str(&["--speed"])).is_err());
+        assert!(parse_profile(&vec_str(&["-a", "extra"])).is_err());
+        assert!(parse_profile(&vec_str(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn applies_profiles_to_ec_buffer() {
+        let mut ec = io::Cursor::new(vec![0u8; 256]);
+
+        FanProfile::Auto.apply_to(&mut ec).unwrap();
+        assert_eq!(ec.get_ref()[0x22], 0x54);
+        assert_eq!(ec.get_ref()[0x21], 0x50);
+
+        FanProfile::Performance.apply_to(&mut ec).unwrap();
+        assert_eq!(ec.get_ref()[0x22], 0x58);
+        assert_eq!(ec.get_ref()[0x21], 0x60);
+
+        FanProfile::Manual(65).apply_to(&mut ec).unwrap();
+        assert_eq!(ec.get_ref()[0x22], 0x5C);
+        assert_eq!(ec.get_ref()[0x21], 0x70);
+        assert_eq!(ec.get_ref()[0x37], 65);
+        assert_eq!(ec.get_ref()[0x3A], 65);
+    }
+
+    #[test]
+    fn reads_ec_rpms_and_rejects_implausible_values() {
+        let mut buf = vec![0u8; 256];
+        // CPU @ 0x13 = 2400 RPM (0x0960 -> [0x60, 0x09])
+        buf[0x13..=0x14].copy_from_slice(&[0x60, 0x09]);
+        // GPU @ 0x15 = 5100 RPM (0x13EC -> [0xEC, 0x13])
+        buf[0x15..=0x16].copy_from_slice(&[0xEC, 0x13]);
+
+        let mut ec = io::Cursor::new(buf);
+        assert_eq!(read_ec_rpms_from(&mut ec), (Some(2400), Some(5100)));
+
+        // Corrupt GPU RPM to 0xFFFF (65535 > 10_000)
+        ec.get_mut()[0x15..=0x16].copy_from_slice(&[0xFF, 0xFF]);
+        assert_eq!(read_ec_rpms_from(&mut ec), (Some(2400), None));
+    }
+
+    #[test]
+    fn discovers_hwmon_temperatures_and_checks_model() {
+        let root = env::temp_dir().join(format!("predator_tdd_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let hwmon0 = root.join("hwmon0");
+        let hwmon1 = root.join("hwmon1");
+        fs::create_dir_all(&hwmon0).unwrap();
+        fs::create_dir_all(&hwmon1).unwrap();
+
+        fs::write(hwmon0.join("name"), "coretemp\n").unwrap();
+        fs::write(hwmon0.join("temp1_input"), "54500\n").unwrap();
+        fs::write(hwmon0.join("temp1_label"), "Package id 0\n").unwrap();
+        fs::write(hwmon0.join("temp2_input"), "52000\n").unwrap();
+
+        fs::write(hwmon1.join("name"), "acpitz\n").unwrap();
+        fs::write(hwmon1.join("temp1_input"), "48000\n").unwrap();
+
+        let hwmons = Hwmon::discover_in(&root);
+        assert_eq!(hwmons.len(), 2);
+        assert_eq!(hwmons[0].name, "acpitz");
+        assert_eq!(hwmons[1].name, "coretemp");
+        assert_eq!(
+            hwmons[1].temperatures(),
+            vec![
+                ("Package id 0".to_string(), 54.5),
+                ("temp2".to_string(), 52.0),
+            ]
+        );
+
+        let model_file = root.join("product_name");
+        fs::write(&model_file, "Predator PH315-51\n").unwrap();
+        assert!(is_supported_model_at(&model_file));
+
+        fs::write(&model_file, "ThinkPad T480\n").unwrap();
+        assert!(!is_supported_model_at(&model_file));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

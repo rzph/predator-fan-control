@@ -1,6 +1,12 @@
 [package]
-name = "predatorfc"
+name = "predator-fan-control"
 version = "0.1.0"
 edition = "2024"
+description = "Monitor temperatures and control fan speeds on the Acer Predator Helios 300 (PH315-51) on Linux"
+license = "MIT"
+readme = "README.md"
+keywords = ["acer", "predator", "helios-300", "fan-control", "hwmon"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
+

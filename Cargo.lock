@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "predatorfc"
+name = "predator-fan-control"
 version = "0.1.0"
