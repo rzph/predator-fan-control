@@ -119,6 +119,19 @@ fn read_ec_rpms_from<R: Read + Seek>(ec: &mut R) -> (Option<u16>, Option<u16>) {
     (read_word(0x13), read_word(0x15))
 }
 
+/// Turns a failed EC access into an actionable message for the user.
+fn explain_ec_error(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::NotFound => format!(
+            "{EC_IO_PATH} not found: load the EC module with 'sudo modprobe ec_sys write_support=1'"
+        ),
+        io::ErrorKind::PermissionDenied => {
+            format!("permission denied on {EC_IO_PATH}: run with sudo (and check Secure Boot lockdown)")
+        }
+        _ => format!("EC access failed: {error}"),
+    }
+}
+
 fn is_supported_model() -> bool {
     is_supported_model_at(Path::new(PRODUCT_NAME_PATH))
 }
@@ -200,7 +213,7 @@ fn main() {
         Ok(Some(profile)) => match profile.apply() {
             Ok(()) => println!("{}", profile.summary()),
             Err(e) => {
-                eprintln!("Failed to apply fan profile {:?}: {e}", profile);
+                eprintln!("Failed to apply fan profile {profile:?}: {}", explain_ec_error(&e));
                 std::process::exit(1);
             }
         },
@@ -250,6 +263,15 @@ mod tests {
         assert!(parse_profile(&vec_str(&["--speed"])).is_err());
         assert!(parse_profile(&vec_str(&["-a", "extra"])).is_err());
         assert!(parse_profile(&vec_str(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn explains_ec_write_errors() {
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        assert!(explain_ec_error(&missing).contains("modprobe ec_sys write_support=1"));
+
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(explain_ec_error(&denied).contains("sudo"));
     }
 
     #[test]
